@@ -36,6 +36,7 @@ BEGIN {
     our @EXPORT = qw(
         checktestcmd
         prepro
+        readtestkeywords
         restore_test_env
         runner_init
         runnerac_clearlocks
@@ -59,7 +60,6 @@ BEGIN {
 
     # these are for debugging only
     our @EXPORT_OK = qw(
-        readtestkeywords
         singletest_preprocess
     );
 }
@@ -99,6 +99,7 @@ use testutil qw(
 
 #######################################################################
 # Global variables set elsewhere but used only by this package
+# These may only be set *before* runner_init is called
 our $DBGCURL=$CURL; #"../src/.libs/curl";  # alternative for debugging
 our $valgrind_logfile="--log-file";  # the option name for valgrind >=3
 our $valgrind_tool="--tool=memcheck";
@@ -121,7 +122,8 @@ my $controllerw;    # pipe that controller writes to
 my $runnerr;        # pipe that runner reads from
 my $runnerw;        # pipe that runner writes to
 my $controllerr;    # pipe that controller reads from
-
+my $multiprocess;   # nonzero with a separate test runner process
+my $onerunnerid;    # a single runner ID
 
 # redirected stdout/stderr to these files
 sub stdoutfn {
@@ -138,12 +140,9 @@ sub stderrfn {
 # Initialize the runner and prepare it to run tests
 #
 sub runner_init {
-    my ($logdir)=@_;
+    my ($logdir, $jobs)=@_;
 
-    # Set this directory as ours
-    # TODO: This will need to be uncommented once there are multiple runners
-    #$LOGDIR = $logdir;
-    mkdir("$LOGDIR/$PIDDIR", 0777);
+    $multiprocess = !!$jobs;
 
     # enable memory debugging if curl is compiled with it
     $ENV{'CURL_MEMDEBUG'} = "$LOGDIR/$MEMDUMP";
@@ -159,8 +158,57 @@ sub runner_init {
     pipe $runnerr, $controllerw;
     pipe $controllerr, $runnerw;
 
-    # There is only one runner right now
-    return "singleton";
+    if($multiprocess) {
+        # Create a separate process in multiprocess mode
+        my $child = fork();
+        if(0 == $child) {
+            # TODO: set up a better signal handler
+            $SIG{INT} = 'IGNORE';
+            $SIG{TERM} = 'IGNORE';
+
+            $onerunnerid = $$;
+            print "Runner $onerunnerid starting\n" if($verbose);
+
+            # Here we are the child (runner).
+            close($controllerw);
+            close($controllerr);
+
+            # Set this directory as ours
+            $LOGDIR = $logdir;
+            mkdir("$LOGDIR/$PIDDIR", 0777);
+
+            # handle IPC calls
+            event_loop();
+
+            # Can't rely on logmsg here in case it's buffered
+            print "Runner $onerunnerid exiting\n" if($verbose);
+            exit 0;
+        }
+        # Here we are the parent (controller).
+        close($runnerw);
+        close($runnerr);
+
+        return $onerunnerid;
+
+    }
+    # Don't create a separate process
+    $onerunnerid = "integrated";
+
+    # Create our pid directory
+    mkdir("$LOGDIR/$PIDDIR", 0777);
+
+    # There is no separate runner
+    return $onerunnerid;
+}
+
+#######################################################################
+# Loop to execute incoming IPC calls until the shutdown call
+sub event_loop {
+    while () {
+        if(ipcrecv()) {
+            last;
+        }
+    }
 }
 
 #######################################################################
@@ -977,6 +1025,11 @@ sub runner_test_preprocess {
     readtestkeywords();
 
     ###################################################################
+    # Restore environment variables that were modified in a previous run.
+    # Test definition may instruct to (un)set environment vars.
+    restore_test_env(1);
+
+    ###################################################################
     # Start the servers needed to run this test case
     my ($why, $error) = singletest_startservers($testnum, \%testtimings);
 
@@ -1106,10 +1159,10 @@ sub controlleripccall {
     # Send IPC call via pipe
     syswrite($controllerw, (pack "L", length($margs)) . $margs);
 
-    # Call the remote function
-    # TODO: this will eventually be done in a separate runner process
-    # kicked off by runner_init()
-    ipcrecv();
+    if(!$multiprocess) {
+        # Call the remote function here in single process mode
+        ipcrecv();
+     }
 }
 
 ###################################################################
@@ -1131,7 +1184,7 @@ sub runnerar {
     my $resarrayref = thaw $buf;
 
     # First argument is runner ID
-    unshift @$resarrayref, "singleton";
+    unshift @$resarrayref, $onerunnerid;
     return @$resarrayref;
 }
 
